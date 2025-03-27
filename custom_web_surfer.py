@@ -2,6 +2,7 @@ import asyncio
 import sys
 import warnings
 import os
+import urllib.parse
 from typing import Any, Dict, Optional, List
 from playwright.async_api import async_playwright, Playwright, BrowserContext, Page, Download
 
@@ -24,84 +25,87 @@ async def patched_lazy_init(self) -> None:
         self._last_download = None
         self._prior_metadata_hash = None
 
-        # Create the playwright instance connecting to remote server
-        if self._playwright is None:
-            # Start playwright
-            self._pw_instance = await async_playwright().__aenter__()
-            
-            # Launch browser based on the URL type
-            if self.playwright_server_url.startswith("ws://"):
-                print(f"Connecting to Playwright server at: {self.playwright_server_url}")
-                # For WebSocket URLs, we'll launch a browser using the Playwright instance
-                # This works with a Playwright server running via `npx playwright run-server`
-                self._playwright = self._pw_instance
+        try:
+            # Create the playwright instance connecting to remote server
+            if self._playwright is None:
+                # Start playwright
+                self._pw_instance = await async_playwright().__aenter__()
                 
-                # The connection will be handled by the browser launch
-                # We use a local browser but controlled by the remote Playwright server
-                browser = await self._playwright.chromium.launch(
-                    headless=self.headless,
-                    # Add some extra arguments for stability
-                    args=[
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu"
-                    ]
+                # Parse the URL to determine connection type
+                parsed_url = urllib.parse.urlparse(self.playwright_server_url)
+                
+                # Launch browser based on the URL type
+                if parsed_url.scheme == "ws":
+                    print(f"Connecting to remote Playwright server at: {self.playwright_server_url}")
+                    
+                    # Connect to the remote Playwright server using WebSockets
+                    # This approach works with a standalone Playwright server running in the cloud
+                    try:
+                        self._playwright = self._pw_instance
+                        browser = await self._playwright.chromium.connect(self.playwright_server_url)
+                        self._browser = browser
+                        print(f"Successfully connected to remote Playwright server")
+                    except Exception as e:
+                        raise ConnectionError(f"Failed to connect to remote Playwright server: {e}")
+                        
+                elif parsed_url.scheme in ["http", "https"]:
+                    # For HTTP URLs, connect to a CDP endpoint
+                    # This works with Chrome/Edge browsers with remote debugging enabled
+                    print(f"Connecting to CDP endpoint at: {self.playwright_server_url}")
+                    self._playwright = self._pw_instance
+                    browser = await self._playwright.chromium.connect_over_cdp(self.playwright_server_url)
+                    self._browser = browser
+                else:
+                    raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}. Use ws:// or http:// URLs.")
+                    
+            # Create the context
+            if self._context is None and self._browser is not None:
+                self._context = await self._browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
                 )
-                self._browser = browser
             else:
-                # For HTTP URLs, connect to a CDP endpoint
-                # This works with Chrome/Edge browsers with remote debugging enabled
-                print(f"Connecting to CDP endpoint at: {self.playwright_server_url}")
-                self._playwright = self._pw_instance
-                browser = await self._playwright.chromium.connect_over_cdp(self.playwright_server_url)
-                self._browser = browser
-                
-        # Create the context
-        if self._context is None and self._browser is not None:
-            self._context = await self._browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
-            )
-        else:
-            raise ValueError("Browser initialization failed")
+                raise ValueError("Browser initialization failed. Check the connection to the remote Playwright server.")
 
-        # Create the page
-        self._context.set_default_timeout(60000)  # One minute
-        self._page = await self._context.new_page()
-        assert self._page is not None
-        self._page.on("download", self._download_handler)
-        if self.to_resize_viewport:
-            await self._page.set_viewport_size({"width": self.VIEWPORT_WIDTH, "height": self.VIEWPORT_HEIGHT})
-        
-        # Try to load the page_script.js file from the current directory first
-        page_script_path = os.path.join(os.getcwd(), "page_script.js")
-        if not os.path.exists(page_script_path):
-            # Fallback to the original location
-            page_script_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), "page_script.js")
-            if not os.path.exists(page_script_path):
-                # As a last resort, try to find it in the package directory
+            # Create the page
+            self._context.set_default_timeout(60000)  # One minute
+            self._page = await self._context.new_page()
+            assert self._page is not None
+            self._page.on("download", self._download_handler)
+            if self.to_resize_viewport:
+                await self._page.set_viewport_size({"width": self.VIEWPORT_WIDTH, "height": self.VIEWPORT_HEIGHT})
+            
+            # Add the initialization script using the local copy
+            # First check if we have a local copy of the script
+            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "page_script.js")
+            
+            # If not found locally, try to use the one from autogen_ext package
+            if not os.path.exists(script_path):
                 try:
                     import autogen_ext
-                    autogen_ext_dir = os.path.dirname(autogen_ext.__file__)
-                    page_script_path = os.path.join(autogen_ext_dir, "agents", "web_surfer", "page_script.js")
+                    package_dir = os.path.dirname(autogen_ext.__file__)
+                    script_path = os.path.join(package_dir, "agents", "web_surfer", "page_script.js")
+                    print(f"Using package script from: {script_path}")
                 except Exception as e:
                     print(f"Warning: Could not find page_script.js: {e}")
-                    page_script_path = None
+                    # Try to continue without the script
+                    script_path = None
+            
+            # Add the init script if found
+            if script_path and os.path.exists(script_path):
+                print(f"Adding init script from: {script_path}")
+                await self._page.add_init_script(path=script_path)
+            else:
+                print("Warning: page_script.js not found. Some functionality may be limited.")
+                
+            await self._page.goto(self.start_page)
+            await self._page.wait_for_load_state()
 
-        # Only add the init script if we found the file
-        if page_script_path and os.path.exists(page_script_path):
-            print(f"Using page script from: {page_script_path}")
-            try:
-                await self._page.add_init_script(path=page_script_path)
-            except Exception as e:
-                print(f"Warning: Failed to add init script: {e}")
-        else:
-            print("Warning: Could not find page_script.js, proceeding without it")
-        
-        await self._page.goto(self.start_page)
-        await self._page.wait_for_load_state()
-
-        # Prepare the debug directory -- which stores the screenshots generated throughout the process
-        await self._set_debug_dir(self.debug_dir)
-        self.did_lazy_init = True
+            # Prepare the debug directory -- which stores the screenshots generated throughout the process
+            await self._set_debug_dir(self.debug_dir)
+            self.did_lazy_init = True
+            
+        except Exception as e:
+            raise ConnectionError(f"Failed to initialize remote browser: {e}")
     else:
         # A remote connection is required, so raise an error if no URL is provided
         raise ValueError("A remote Playwright server URL is required. Please provide the 'playwright_server_url' parameter.")
